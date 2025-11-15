@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>VBA
+</head>
+<body>
+<h1>copy </h1>
+<p>copy code
+<pre><code>
+Option Explicit
+
+'―― 高速化のサンドボックス（失敗しても元に戻す）
+Private Type FastCtx
+    calcMode As XlCalculation
+    scr As Boolean
+    evt As Boolean
+    stat As Boolean
+End Type
+
+Private Sub BeginFast(ByRef ctx As FastCtx)
+    With Application
+        ctx.calcMode = .Calculation
+        ctx.scr = .ScreenUpdating
+        ctx.evt = .EnableEvents
+        ctx.stat = .DisplayStatusBar
+
+        .ScreenUpdating = False
+        .EnableEvents = False
+        .DisplayStatusBar = False
+        .Calculation = xlCalculationManual
+    End With
+End Sub
+
+Private Sub EndFast(ByRef ctx As FastCtx)
+    With Application
+        .Calculation = ctx.calcMode
+        .ScreenUpdating = ctx.scr
+        .EnableEvents = ctx.evt
+        .DisplayStatusBar = ctx.stat
+    End With
+End Sub
+
+'==== メイン：A2:B(最終)の全パターンを、A1:B1に流し込み→C1:D1を計算→回収 ====
+
+Public Sub Run_AB_to_CD_Batch_ToCSV()
+    Dim ctx As FastCtx: BeginFast ctx
+    On Error GoTo CleanFail
+
+    Dim sht As Worksheet: Set sht = ThisWorkbook.Worksheets("Sheet1") '←必要に応じて変更
+    Dim lastRow As Long, i As Long, n As Long
+    Dim rngIn As Range, rngOut As Range
+    Dim arrIn As Variant, arrRet() As Variant
+    Dim cellA1 As Range, cellB1 As Range
+    Dim header As Variant
+    Dim fso As Object, ts As Object
+    Dim outputPath As String
+    Dim line As String
+
+    Set cellA1 = sht.Range("A1")
+    Set cellB1 = sht.Range("B1")
+    Set rngOut = sht.Range("C1:D1")
+
+    lastRow = sht.Cells(sht.Rows.Count, "A").End(xlUp).Row
+    If lastRow < 2 Then GoTo CleanExit
+
+    Set rngIn = sht.Range("A2:B" & lastRow)
+    arrIn = rngIn.Value2
+    n = UBound(arrIn, 1)
+    ReDim arrRet(1 To n, 1 To 2)
+
+    ' ヘッダー（E1:F1）
+    header = sht.Range("E1:F1").Value2
+
+    For i = 1 To n
+        cellA1.Value2 = arrIn(i, 1)
+        cellB1.Value2 = arrIn(i, 2)
+
+        On Error Resume Next
+        cellA1.Dirty
+        cellB1.Dirty
+        On Error GoTo 0
+        Application.Calculate
+
+        arrRet(i, 1) = rngOut.Cells(1, 1).Value2
+        arrRet(i, 2) = rngOut.Cells(1, 2).Value2
+    Next i
+
+    '=== CSV出力 ===
+    outputPath = ThisWorkbook.Path & "\output.csv"
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set ts = fso.CreateTextFile(outputPath, True, False) ' overwrite, ASCII
+
+    ' ヘッダー行
+    line = header(1, 1) & "," & header(1, 2)
+    ts.WriteLine line
+
+    ' データ行
+    For i = 1 To n
+        line = arrRet(i, 1) & "," & arrRet(i, 2)
+        ts.WriteLine line
+    Next i
+
+    ts.Close
+    MsgBox "出力完了: " & outputPath, vbInformation
+
+CleanExit:
+    EndFast ctx
+    Exit Sub
+CleanFail:
+    EndFast ctx
+    MsgBox "エラー: " & Err.Description, vbExclamation
+End Sub
+
+
+Option Explicit
+
+'================ 共分散（母分散） =========================
+Public Function CovMatrix(data As Range) As Variant
+    Dim n As Long, m As Long, i As Long, j As Long
+    n = data.Rows.Count
+    m = data.Columns.Count
+    Dim arr As Variant: arr = data.Value
+    Dim cov() As Double
+    ReDim cov(1 To m, 1 To m)
+    Dim avg_i As Double, avg_j As Double, s As Double, t As Long
+    For i = 1 To m
+        avg_i = Application.WorksheetFunction.Average(Application.Index(arr, 0, i))
+        For j = 1 To m
+            avg_j = Application.WorksheetFunction.Average(Application.Index(arr, 0, j))
+            s = 0#
+            For t = 1 To n
+                s = s + (arr(t, i) - avg_i) * (arr(t, j) - avg_j)
+            Next t
+            cov(i, j) = s / n  '標本なら / (n-1)
+        Next j
+    Next i
+    CovMatrix = cov
+End Function
+
+'================ 共通ヘルパ ===============================
+Private Function Ensure2D(ByVal V As Variant) As Variant
+    If TypeName(V) = "Range" Then
+        Ensure2D = V.Value2
+    ElseIf IsArray(V) Then
+        Dim l1 As Long, u2 As Long
+        On Error Resume Next
+        l1 = LBound(V, 1): u2 = UBound(V, 2)
+        If Err.Number <> 0 Then
+            Err.Clear
+            Dim L As Long, U As Long, i As Long
+            L = LBound(V): U = UBound(V)
+            Dim A() As Variant: ReDim A(1 To U - L + 1, 1 To 1)
+            For i = L To U: A(i - L + 1, 1) = V(i): Next
+            Ensure2D = A
+        Else
+            Ensure2D = V
+        End If
+        On Error GoTo 0
+    Else
+        Dim a1(1 To 1, 1 To 1) As Variant
+        a1(1, 1) = V
+        Ensure2D = a1
+    End If
+End Function
+
+Private Function ToDoubleVectorV(col2D As Variant) As Variant
+    Dim rL As Long, rU As Long, i As Long
+    rL = LBound(col2D, 1): rU = UBound(col2D, 1)
+    Dim V() As Double: ReDim V(1 To rU - rL + 1)
+    For i = rL To rU
+        If IsError(col2D(i, 1)) Or IsEmpty(col2D(i, 1)) Or Not IsNumeric(col2D(i, 1)) Then
+            V(i - rL + 1) = 0#
+        Else
+            V(i - rL + 1) = CDbl(col2D(i, 1))
+        End If
+    Next
+    ToDoubleVectorV = V
+End Function
+
+Private Function ToDoubleMatrixV(mat2D As Variant) As Variant
+    Dim rL As Long, rU As Long, cL As Long, cU As Long, i As Long, j As Long
+    rL = LBound(mat2D, 1): rU = UBound(mat2D, 1)
+    cL = LBound(mat2D, 2): cU = UBound(mat2D, 2)
+    Dim m() As Double: ReDim m(1 To rU - rL + 1, 1 To cU - cL + 1)
+    For i = rL To rU
+        For j = cL To cU
+            If IsError(mat2D(i, j)) Or IsEmpty(mat2D(i, j)) Or Not IsNumeric(mat2D(i, j)) Then
+                m(i - rL + 1, j - cL + 1) = 0#
+            Else
+                m(i - rL + 1, j - cL + 1) = CDbl(mat2D(i, j))
+            End If
+        Next j
+    Next i
+    ToDoubleMatrixV = m
+End Function
+
+Private Function MatVecV(m As Variant, V As Variant) As Variant
+    Dim n As Long, i As Long, j As Long
+    n = UBound(V)
+    Dim res() As Double: ReDim res(1 To n)
+    For i = 1 To n
+        Dim s As Double: s = 0#
+        For j = 1 To n
+            s = s + m(i, j) * V(j)
+        Next j
+        res(i) = s
+    Next i
+    MatVecV = res
+End Function
+
+Private Function MaxDiagV(Mtx As Variant) As Double
+    Dim n As Long, i As Long, maxVal As Double
+    n = UBound(Mtx, 1)
+    maxVal = Mtx(1, 1)
+    For i = 2 To n
+        If Mtx(i, i) > maxVal Then maxVal = Mtx(i, i)
+    Next
+    MaxDiagV = maxVal
+End Function
+
+Private Function VMax(A As Double, b As Double) As Double
+    If A > b Then VMax = A Else VMax = b
+End Function
+
+Private Function ProjectCappedSimplexV(V As Variant, L As Variant, U As Variant) As Variant
+    Dim n As Long: n = UBound(V)
+    Dim w() As Double: ReDim w(1 To n)
+
+    Dim lo As Double, hi As Double, mid As Double, s As Double
+    Dim i As Long, z As Double
+    lo = -1000000000000#: hi = 1000000000000#
+
+    For i = 1 To n
+        If V(i) - U(i) > lo Then lo = V(i) - U(i)
+        If V(i) - L(i) < hi Then hi = V(i) - L(i)
+    Next
+
+    Dim it As Long
+    For it = 1 To 60
+        mid = 0.5 * (lo + hi)
+        s = 0#
+        For i = 1 To n
+            z = V(i) - mid
+            If z < L(i) Then
+                z = L(i)
+            ElseIf z > U(i) Then
+                z = U(i)
+            End If
+            s = s + z
+        Next
+        If s > 1# Then
+            lo = mid
+        Else
+            hi = mid
+        End If
+    Next
+
+    For i = 1 To n
+        z = V(i) - hi
+        If z < L(i) Then
+            z = L(i)
+        ElseIf z > U(i) Then
+            z = U(i)
+        End If
+        w(i) = z
+    Next
+    ProjectCappedSimplexV = w
+End Function
+
+Option Explicit
+
+'=== コレスキー（下三角）分解: A=LL'。失敗時 Falseを返す ===
+Private Function CholeskyDecomp(A As Variant, L As Variant) As Boolean
+    Dim n As Long: n = UBound(A, 1)
+    Dim i As Long, j As Long, k As Long
+    Dim s As Double
+    ReDim L(1 To n, 1 To n)
+    On Error GoTo Fail
+    For i = 1 To n
+        For j = 1 To i
+            s = 0#
+            For k = 1 To j - 1
+                s = s + L(i, k) * L(j, k)
+            Next
+            If i = j Then
+                s = A(i, i) - s
+                If s <= 0# Then CholeskyDecomp = False: Exit Function
+                L(i, j) = Sqr(s)
+            Else
+                L(i, j) = (A(i, j) - s) / L(j, j)
+            End If
+        Next
+    Next
+    CholeskyDecomp = True
+    Exit Function
+Fail:
+    CholeskyDecomp = False
+End Function
+
+'=== コレスキーで Ax=b を解く（前進・後退代入） ===
+Private Function CholeskySolve(A As Variant, b As Variant) As Variant
+    Dim n As Long: n = UBound(A, 1)
+    Dim L As Variant, y() As Double, x() As Double
+    Dim i As Long, k As Long, s As Double
+    If Not CholeskyDecomp(A, L) Then Err.Raise 5, , "Cholesky失敗（半正定値ではない）"
+    ReDim y(1 To n)
+    ' 前進代入: L y = b
+    For i = 1 To n
+        s = b(i)
+        For k = 1 To i - 1: s = s - L(i, k) * y(k): Next
+        y(i) = s / L(i, i)
+    Next
+    ' 後退代入: L' x = y
+    ReDim x(1 To n)
+    For i = n To 1 Step -1
+        s = y(i)
+        For k = i + 1 To n: s = s - L(k, i) * x(k): Next
+        x(i) = s / L(i, i)
+    Next
+    CholeskySolve = x
+End Function
+
+'=== {w | sum w = target, L<=w<=U} への射影（二分探索） ===
+Private Sub ProjectBoxSimplexArr(w() As Double, L() As Double, U() As Double, ByVal target As Double)
+    Dim n As Long: n = UBound(w)
+    Dim i As Long, lo As Double, hi As Double, mid As Double, s As Double, z As Double
+    lo = -1000000000000#: hi = 1000000000000#
+    For i = 1 To n
+        If w(i) - U(i) > lo Then lo = w(i) - U(i)
+        If w(i) - L(i) < hi Then hi = w(i) - L(i)
+    Next
+    Dim it As Long
+    For it = 1 To 60
+        mid = 0.5 * (lo + hi)
+        s = 0#
+        For i = 1 To n
+            z = w(i) - mid
+            If z < L(i) Then
+                z = L(i)
+            ElseIf z > U(i) Then
+                z = U(i)
+            End If
+            s = s + z
+        Next
+        If s > target Then lo = mid Else hi = mid
+    Next
+    For i = 1 To n
+        z = w(i) - hi
+        If z < L(i) Then
+            z = L(i)
+        ElseIf z > U(i) Then
+            z = U(i)
+        End If
+        w(i) = z
+    Next i
+End Sub
+
+'=== 厳密解（等式+上下限）: 逆行列/ワークシート関数 不使用／横ベクトル返し ===
+' 使い方: =GMV_BOUNDED_EXACT(CovMatrix(OFFSET($X$2,0,0,125,6)), AN5:AN10, AM5:AM10)
+Public Function GMV_BOUNDED_EXACT( _
+    ByVal covInput As Variant, _
+    ByVal L As Variant, _
+    ByVal U As Variant, _
+    Optional ByVal ridge As Double = 0.0000000001, _
+    Optional ByVal tol As Double = 0.000000000001, _
+    Optional ByVal maxIter As Long = 200 _
+) As Variant
+    On Error GoTo Fail
+
+    '--- Σ 受取（Range/配列OK） ---
+    Dim V As Variant
+    If TypeName(covInput) = "Range" Then
+        V = covInput.Value2
+    Else
+        V = covInput
+    End If
+    Dim n As Long, m As Long, i As Long, j As Long
+    n = UBound(V, 1): m = UBound(V, 2)
+    If n <> m Then Err.Raise 5, , "共分散は正方行列が必要です"
+
+    Dim Sigma() As Double: ReDim Sigma(1 To n, 1 To n)
+    For i = 1 To n
+        For j = 1 To n
+            Sigma(i, j) = CDbl(V(i, j))
+        Next
+    Next
+    If ridge > 0# Then For i = 1 To n: Sigma(i, i) = Sigma(i, i) + ridge: Next
+
+    '--- L/U 受取（Range/配列OK, 縦ベクトル想定） ---
+    Dim LV As Variant, UV As Variant
+    LV = IIf(TypeName(L) = "Range", L.Value2, L)
+    UV = IIf(TypeName(U) = "Range", U.Value2, U)
+    Dim Lb() As Double, Ub() As Double
+    ReDim Lb(1 To n): ReDim Ub(1 To n)
+    For i = 1 To n
+        Lb(i) = CDbl(LV(i, 1))
+        Ub(i) = CDbl(UV(i, 1))
+    Next
+
+    '--- 可行性チェック ---
+    Dim sumL As Double, sumU As Double
+    For i = 1 To n: sumL = sumL + Lb(i): sumU = sumU + Ub(i): Next
+    If sumL > 1# + 0.000000000001 Or sumU < 1# - 0.000000000001 Then Err.Raise 5, , "不可行: SUM(L)?1?SUM(U)"
+
+    '--- 初期点: 均等→射影 ---
+    Dim w() As Double: ReDim w(1 To n)
+    For i = 1 To n: w(i) = 1# / n: Next
+    ProjectBoxSimplexArr w, Lb, Ub, 1#
+
+    '--- アクティブセット ---
+    Dim isB() As Boolean: ReDim isB(1 To n)
+    For i = 1 To n
+        If Abs(w(i) - Lb(i)) < 10 * tol Or Abs(w(i) - Ub(i)) < 10 * tol Then isB(i) = True
+    Next
+
+    Dim iter As Long
+    For iter = 1 To maxIter
+        Dim sumFixed As Double: sumFixed = 0#
+        Dim cntF As Long: cntF = 0
+        For i = 1 To n
+            If isB(i) Then sumFixed = sumFixed + w(i) Else cntF = cntF + 1
+        Next
+        If cntF = 0 Then Exit For
+        Dim targetSum As Double: targetSum = 1# - sumFixed
+
+        ' 自由集合インデックス
+        Dim F() As Long, idx As Long
+        ReDim F(1 To cntF): idx = 0
+        For i = 1 To n
+            If Not isB(i) Then idx = idx + 1: F(idx) = i
+        Next
+
+        ' FF と 1_F を用意
+        Dim FF() As Double: ReDim FF(1 To cntF, 1 To cntF)
+        Dim oneF() As Double: ReDim oneF(1 To cntF)
+        For i = 1 To cntF
+            oneF(i) = 1#
+            For j = 1 To cntF
+                FF(i, j) = Sigma(F(i), F(j))
+            Next
+        Next
+
+        ' y = FF^{-1} * 1_F（コレスキーで直接解く）
+        Dim y As Variant: y = CholeskySolve(FF, oneF)
+
+        ' α = target / (1_F' y)
+        Dim den As Double: den = 0#
+        For i = 1 To cntF: den = den + oneF(i) * y(i): Next
+        If Abs(den) < 1E-18 Then Err.Raise 5, , "特異行列（ridge を上げてください）"
+        Dim alpha As Double: alpha = targetSum / den
+
+        ' w_F = α y
+        For i = 1 To cntF
+            w(F(i)) = alpha * y(i)
+        Next
+
+        ' 境界処理
+        Dim changed As Boolean: changed = False
+        For i = 1 To cntF
+            Dim k As Long: k = F(i)
+            If w(k) < Lb(k) - tol Then w(k) = Lb(k): isB(k) = True: changed = True
+            If w(k) > Ub(k) + tol Then w(k) = Ub(k): isB(k) = True: changed = True
+        Next
+        If changed Then GoTo NextIter
+
+        ' KKTチェック
+        Dim Sw() As Double: ReDim Sw(1 To n)
+        Dim acc As Double
+        For i = 1 To n
+            acc = 0#
+            For j = 1 To n: acc = acc + Sigma(i, j) * w(j): Next
+            Sw(i) = acc
+        Next
+        Dim nu As Double, cnt As Long: nu = 0#: cnt = 0
+        For i = 1 To n: If Not isB(i) Then nu = nu + 2# * Sw(i): cnt = cnt + 1
+        Next
+        If cnt > 0 Then nu = nu / cnt Else nu = 2# * Sw(1)
+
+        Dim violated As Long: violated = 0
+        For i = 1 To n
+            If isB(i) Then
+                Dim gi As Double: gi = 2# * Sw(i) - nu
+                If Abs(w(i) - Lb(i)) < 10 * tol Then
+                    If gi < -0.0000000001 Then isB(i) = False: violated = violated + 1
+                ElseIf Abs(w(i) - Ub(i)) < 10 * tol Then
+                    If gi > 0.0000000001 Then isB(i) = False: violated = violated + 1
+                End If
+            End If
+        Next
+        If violated = 0 Then Exit For
+NextIter:
+    Next
+
+    ' 合計=1 に微調整
+    Dim sumW As Double: sumW = 0#
+    For i = 1 To n: sumW = sumW + w(i): Next
+    Dim delta As Double: delta = 1# - sumW
+    For i = 1 To n
+        If w(i) > Lb(i) + 10 * tol And w(i) < Ub(i) - 10 * tol Then
+            w(i) = w(i) + delta
+            Exit For
+        End If
+    Next
+
+    ' 横ベクトル返し
+    Dim out() As Variant: ReDim out(1 To 1, 1 To n)
+    For i = 1 To n: out(1, i) = w(i): Next
+    GMV_BOUNDED_EXACT = out
+    Exit Function
+
+Fail:
+    GMV_BOUNDED_EXACT = CVErr(xlErrValue)
+End Function
+
+
+
+</code></pre>pre
+
+</body>
+</html>
