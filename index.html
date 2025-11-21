@@ -15,13 +15,19 @@ Dim msg
 Dim ws
 Dim extList, i, fileFolder, fileNameOnly, candidate
 Dim found
+Dim targetSheets
+Dim keepDict, arr, nameText, anyExists
 
-' ★ここに事前指定したいパスを入れる
-'   例1: フルパス → "C:\Users\xxx\Desktop\式付き.xlsx"
+' ★ここに事前指定したいファイルパス（またはファイル名）を入れる
+'   空文字のままなら起動時にInputBoxで聞く
+'   例1: フルパス → "C:\Users\xxx\Desktop\式付き"
 '   例2: このVBSと同じフォルダのファイル → "式付き"
-'   何も指定しない場合は "" のままにする
 presetPath = ""
 
+' ★ここに値貼り付けしたいシート名をカンマ区切りで指定
+'   例: "Sheet1,Sheet2,集計"
+'   空文字のままなら「全てのワークシート」が対象（削除もしない）
+targetSheets = "Sheet2"
 
 ' FileSystemObject を作成
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -51,7 +57,7 @@ If InStr(userInput, "\") = 0 And InStr(userInput, ":") = 0 Then
         found = True
     End If
 Else
-    ' パスっぽい入力
+    ' パス付き
     If fso.FileExists(userInput) Then
         resolvedPath = userInput
         found = True
@@ -110,10 +116,54 @@ If Err.Number <> 0 Or (wb Is Nothing) Then
 End If
 Err.Clear
 
-' --- 全シートで値貼り付け ---
+' --- シート絞り込み（targetSheets が指定されている場合のみ）---
+If targetSheets <> "" Then
+    Set keepDict = CreateObject("Scripting.Dictionary")
+    arr = Split(targetSheets, ",")
+    For i = 0 To UBound(arr)
+        nameText = Trim(arr(i))
+        If nameText <> "" Then
+            If Not keepDict.Exists(LCase(nameText)) Then
+                keepDict.Add LCase(nameText), True
+            End If
+        End If
+    Next
+
+    ' 少なくとも1つは存在するかチェック
+    anyExists = False
+    For Each ws In wb.Worksheets
+        If keepDict.Exists(LCase(ws.Name)) Then
+            anyExists = True
+        End If
+    Next
+
+    If Not anyExists Then
+        MsgBox "指定したシート名がブック内に存在しません。targetSheets の設定を確認してください。", vbCritical, "エラー"
+        wb.Close False
+        xl.Quit
+        WScript.Quit
+    End If
+
+    ' 残さないシートを削除（後ろから順に）
+    For i = wb.Worksheets.Count To 1 Step -1
+        Set ws = wb.Worksheets(i)
+        If Not keepDict.Exists(LCase(ws.Name)) Then
+            ws.Delete
+        End If
+    Next
+End If
+
+' --- 全シートで値貼り付け（コピー→値貼り付け方式） ---
+Const xlPasteValues = -4163  ' xlPasteValues
+
 For Each ws In wb.Worksheets
-    ws.UsedRange.Value = ws.UsedRange.Value
+    If Not ws.UsedRange Is Nothing Then
+        ws.UsedRange.Copy
+        ws.UsedRange.PasteSpecial xlPasteValues
+    End If
 Next
+
+xl.CutCopyMode = False
 
 If Err.Number <> 0 Then
     MsgBox "値貼り付け中にエラーが発生しました。原因: " & Err.Description, vbCritical, "エラー"
@@ -145,6 +195,9 @@ xl.Quit
 ' --- 完了メッセージ ---
 MsgBox "元ファイル: " & resolvedPath & vbCrLf & "値貼り付け後のファイルを次の名前で保存しました。" & vbCrLf & newPath, vbInformation, "完了"
 
+
+
+    
 Option Explicit
 
 '================ 共分散（母分散） =========================
