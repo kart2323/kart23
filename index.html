@@ -598,6 +598,36 @@ Fail:
     GMV_BOUNDED_EXACT = CVErr(xlErrValue)
 End Function
 
+Sub RunSolverStable()
+
+    ' 再現性のためにマルチスレッド停止
+    Application.MultiThreadedCalculation.Enabled = False
+
+    ' 強制再計算（順序を統一）
+    Application.CalculateFullRebuild
+
+    ' 初期値を強制設定
+    Range("K4:P4").Value = 1 / 6
+
+    SolverReset
+    SolverOk SetCell:="$K$36", MaxMinVal:=2, _
+        ByChange:="$K$4:$P$4"
+
+    ' 制約
+    SolverAdd CellRef:="$K$4:$P$4", Relation:=3, FormulaText:=1
+    SolverAdd CellRef:="$K$4:$P$4", Relation:=1, FormulaText:="0"
+
+    ' Solver オプションを明示指定
+    SolverOptions Precision:=1E-12, Convergence:=1E-12, _
+        MaxTime:=999, MaxIterations:=2000, _
+        Scaling:=True, AssumeLinear:=False, StepThru:=False
+
+    SolverSolve UserFinish:=True
+
+    ' マルチスレッドを元に戻す
+    Application.MultiThreadedCalculation.Enabled = True
+
+End Sub
 
 
 </code></pre>pre
