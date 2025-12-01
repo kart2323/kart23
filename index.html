@@ -7,6 +7,243 @@
 <h1>copy </h1>
 <p>copy code
 <pre><code>
+
+'====================================================
+' Bloomberg 関数入り Excel を複数ファイル順番に処理する VBS
+'
+' 各ブックごとの処理：
+'   1) 開く
+'   2) Excel 計算モードを自動に設定
+'   3) CalculateFullRebuild で一度だけフル再計算
+'   4) Named Range "blg更新判定" の有無で分岐
+'      - 無い：判定スキップ → マクロA（指定あれば）実行 → 保存 → 閉じる
+'      - 有る：ステータス監視ループ
+'         * 0：OK → マクロA（指定あれば）実行 → 保存 → 閉じる
+'         * 1：更新中 → waitShort 待って再度 GetStatus（再計算なし）
+'         * 2：最新でない → waitLong 待ってから CalculateFull → 再度判定
+'         * 3 / その他：エラー扱い → 保存せず閉じる
+'
+'   ※ この VBS は Bloomberg 専用マクロ呼び出しは一切せず、
+'      「再計算による更新＋blg更新判定セルのロジック」に完全依存する設計。
+'====================================================
+
+Option Explicit
+
+'================ ユーザー設定ゾーン =====================
+
+' ▼ 処理したい Excelファイル と「成功時に実行するマクロ名」のセット
+'   形式: Array( Array("ファイルパス1", "マクロ名1"), _
+'                Array("ファイルパス2", ""), _
+'                Array("ファイルパス3", "Module1.Cleanup") )
+'   マクロ名が "" の場合、そのブックではマクロ実行をスキップ。
+Dim jobs
+jobs = Array( _
+    Array("C:\Path\To\Book1.xlsm", "MacroA"), _
+    Array("C:\Path\To\Book2.xlsm", ""), _
+    Array("C:\Path\To\Book3.xlsm", "Module1.PostProcess") _
+)
+
+' ▼ 待ち時間（ミリ秒）
+Dim waitShort, waitLong
+waitShort = 5000   ' ステータス1のときの再チェック待ち (5秒)
+waitLong  = 15000  ' ステータス2のときの待ち＋再計算 (15秒)
+
+' ▼ ステータス監視の最大ループ回数
+Dim maxCheckLoop
+maxCheckLoop = 30   ' 1/2 状態でぐるぐるしすぎないための上限
+
+'====================================================
+
+Dim excelApp
+Dim statusCell
+Dim hadError
+hadError = False
+
+'================ ステータス取得関数 ========================
+' Named Range "blg更新判定" からステータス(0/1/2/3)を Long で取得
+' 読めなかった場合は 3 を返す（エラー扱い）
+Function GetStatus()
+    On Error Resume Next
+    Dim v
+    v = statusCell.Value
+
+    If Err.Number <> 0 Then
+        Err.Clear
+        GetStatus = 3   ' エラー → 異常扱い
+        Exit Function
+    End If
+
+    If IsNumeric(v) Then
+        GetStatus = CLng(v)
+    Else
+        GetStatus = 3   ' 数値でない → 異常扱い
+    End If
+End Function
+
+'================ 単一ブック処理 ========================
+Sub ProcessWorkbook(ByVal xlApp, ByVal filePath, ByVal macroName)
+    Dim wb
+    Dim s, i
+    Dim finalStatus
+    Dim hasJudge As Boolean
+
+    On Error Resume Next
+    Set wb = xlApp.Workbooks.Open(filePath)
+    If Err.Number <> 0 Then
+        WScript.Echo "[ERROR] ブックを開けませんでした: " & filePath & " / " & Err.Description
+        Err.Clear
+        hadError = True
+        Exit Sub
+    End If
+    On Error GoTo 0
+
+    WScript.Echo ">> 開始: " & filePath
+
+    '==== blg更新判定 Named Range の存在チェック ====
+    On Error Resume Next
+    Set statusCell = wb.Names("blg更新判定").RefersToRange
+    If Err.Number <> 0 Then
+        ' ★ Named Range がない → 判定スキップモード
+        hasJudge = False
+        Err.Clear
+    Else
+        hasJudge = True
+    End If
+    On Error GoTo 0
+
+    '------ Excel計算モードを自動(Automatic)に ------
+    ' xlCalculationAutomatic = -4105
+    xlApp.Calculation = -4105
+
+    '------ 最初の再計算（これを1回だけ） ------
+    xlApp.CalculateFullRebuild
+    WScript.Sleep waitShort
+
+    '===== 判定スキップモードの場合 =====
+    If Not hasJudge Then
+        WScript.Echo "  [INFO] blg更新判定 が無いため、判定をスキップします。"
+
+        ' マクロ名が指定されていれば実行
+        If macroName <> "" Then
+            On Error Resume Next
+            WScript.Echo "  [INFO] マクロ実行（判定スキップ）: " & macroName
+            xlApp.Run macroName
+            If Err.Number <> 0 Then
+                WScript.Echo "  [ERROR] マクロ実行に失敗: " & macroName & " / " & Err.Description
+                Err.Clear
+                hadError = True
+            End If
+            On Error GoTo 0
+        End If
+
+        ' 保存して終了
+        wb.Save
+        WScript.Echo "  [INFO] 保存完了（判定スキップ）: " & filePath
+        wb.Close False
+        WScript.Echo ">> 終了（判定スキップ）: " & filePath
+        Exit Sub
+    End If
+
+    '================= ここから通常のステータス判定 ===============
+    finalStatus = 3 ' デフォルトは異常扱い
+
+    For i = 1 To maxCheckLoop
+
+        s = GetStatus()
+        finalStatus = s
+
+        Select Case s
+            Case 0
+                WScript.Echo "  [INFO] Bloomberg 更新完了（ステータス0）"
+                Exit For
+
+            Case 1
+                ' 更新中：ただ待つだけ。再計算はしない
+                WScript.Echo "  [INFO] 更新処理中（ステータス1）。再チェック待機 " & (waitShort / 1000) & " 秒。"
+                WScript.Sleep waitShort
+
+            Case 2
+                ' 最新でない：待ってから再計算して再チェック
+                WScript.Echo "  [INFO] データが最新でない可能性（ステータス2）。待機 " & (waitLong / 1000) & " 秒後に再計算。"
+                WScript.Sleep waitLong
+                xlApp.CalculateFull  ' ★ここだけ再計算を許可（必要最小限）
+
+            Case 3
+                WScript.Echo "  [ERROR] ステータス3：未接続/エラー。保存せず終了します。"
+                hadError = True
+                Exit For
+
+            Case Else
+                WScript.Echo "  [ERROR] 想定外ステータス: " & s & "。保存せず終了します。"
+                hadError = True
+                Exit For
+        End Select
+
+    Next
+
+    '===== 最終ステータスで結果処理 =====
+    If finalStatus = 0 Then
+
+        ' マクロ実行
+        If macroName <> "" Then
+            On Error Resume Next
+            WScript.Echo "  [INFO] マクロ実行: " & macroName
+            xlApp.Run macroName
+            If Err.Number <> 0 Then
+                WScript.Echo "  [ERROR] マクロ実行失敗: " & macroName & " / " & Err.Description
+                Err.Clear
+                hadError = True
+            End If
+            On Error GoTo 0
+        End If
+
+        wb.Save
+        WScript.Echo "  [INFO] 保存完了: " & filePath
+        wb.Close False
+
+    Else
+        ' ステータス0以外：保存せず閉じる
+        WScript.Echo "  [WARN] ステータス0以外(" & finalStatus & ")のため、保存せずクローズ: " & filePath
+        wb.Close False
+    End If
+
+    WScript.Echo ">> 終了: " & filePath
+End Sub
+
+'================ メイン ========================
+
+On Error Resume Next
+Set excelApp = CreateObject("Excel.Application")
+If Err.Number <> 0 Then
+    WScript.Echo "[FATAL] Excel を起動できませんでした: " & Err.Description
+    WScript.Quit 1
+End If
+On Error GoTo 0
+
+' 自動バッチ用設定（画面非表示・アラート抑制）
+excelApp.Visible = False
+excelApp.DisplayAlerts = False
+excelApp.EnableEvents = False
+
+Dim job, filePath, macroName
+For Each job In jobs
+    filePath = job(0)
+    macroName = job(1)
+    ProcessWorkbook excelApp, filePath, macroName
+Next
+
+excelApp.Quit
+Set excelApp = Nothing
+
+If hadError Then
+    WScript.Echo "=== 終了（エラーあり）==="
+    WScript.Quit 1
+Else
+    WScript.Echo "=== 正常終了（全ブックOK or ステータス0以外は非保存クローズ）==="
+    WScript.Quit 0
+End If
+
+値貼り付けまくろ
 Option Explicit
 
 Dim xl, wb, fso
