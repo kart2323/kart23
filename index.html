@@ -27,7 +27,7 @@ presetPath = ""
 ' ★ここに値貼り付けしたいシート名をカンマ区切りで指定
 '   例: "Sheet1,Sheet2,集計"
 '   空文字のままなら「全てのワークシート」が対象（削除もしない）
-targetSheets = "Sheet2"
+targetSheets = "sheet2"
 
 ' FileSystemObject を作成
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -116,6 +116,27 @@ If Err.Number <> 0 Or (wb Is Nothing) Then
 End If
 Err.Clear
 
+
+' --- 全シートで値貼り付け（コピー→値貼り付け方式） ---
+Const xlPasteValues = -4163  ' xlPasteValues
+
+For Each ws In wb.Worksheets
+    If Not ws.UsedRange Is Nothing Then
+        ws.UsedRange.Copy
+        ws.UsedRange.PasteSpecial xlPasteValues
+    End If
+Next
+
+xl.CutCopyMode = False
+
+If Err.Number <> 0 Then
+    MsgBox "値貼り付け中にエラーが発生しました。原因: " & Err.Description, vbCritical, "エラー"
+    wb.Close False
+    xl.Quit
+    WScript.Quit
+End If
+Err.Clear
+
 ' --- シート絞り込み（targetSheets が指定されている場合のみ）---
 If targetSheets <> "" Then
     Set keepDict = CreateObject("Scripting.Dictionary")
@@ -153,25 +174,6 @@ If targetSheets <> "" Then
     Next
 End If
 
-' --- 全シートで値貼り付け（コピー→値貼り付け方式） ---
-Const xlPasteValues = -4163  ' xlPasteValues
-
-For Each ws In wb.Worksheets
-    If Not ws.UsedRange Is Nothing Then
-        ws.UsedRange.Copy
-        ws.UsedRange.PasteSpecial xlPasteValues
-    End If
-Next
-
-xl.CutCopyMode = False
-
-If Err.Number <> 0 Then
-    MsgBox "値貼り付け中にエラーが発生しました。原因: " & Err.Description, vbCritical, "エラー"
-    wb.Close False
-    xl.Quit
-    WScript.Quit
-End If
-Err.Clear
 
 ' --- 同じフォルダに、必ず .xlsx（マクロなし）で保存 ---
 folderPath = fso.GetParentFolderName(resolvedPath)
@@ -195,10 +197,6 @@ xl.Quit
 ' --- 完了メッセージ ---
 MsgBox "元ファイル: " & resolvedPath & vbCrLf & "値貼り付け後のファイルを次の名前で保存しました。" & vbCrLf & newPath, vbInformation, "完了"
 
-
-
-    
-Option Explicit
 
 '================ 共分散（母分散） =========================
 Public Function CovMatrix(data As Range) As Variant
