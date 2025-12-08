@@ -7,7 +7,838 @@
 <h1>copy </h1>
 <p>copy code
 <pre><code>
+'====================================================
+' Bloomberg + Excel 自動実行 VBS（ログ・各種フラグ付き 拡張版）
+'====================================================
 
+Option Explicit
+
+'================ ユーザー設定 =====================
+Dim jobs
+jobs = Array( _
+    Array("Book1.xlsm", "MacroA"), _
+    Array("Book2", ""), _
+    Array("C:\Path\To\Book3", "Module1.PostProcess") _
+)
+
+Dim waitShort, waitLong
+waitShort = 5000     ' ステータス1 → 再チェック待ち (ms)
+waitLong  = 15000    ' ステータス2 → 待ち＋再計算 (ms)
+
+Dim maxCheckLoop
+maxCheckLoop = 30     ' ステータス1/2 の最大チェック回数
+
+' ログ出力名設定：
+' ReportName = "test"           → yyyymmdd_test_正常終了/エラー有.txt
+' ReportName = "ログ\test"      → yyyymmdd_test_正常終了/エラー有.txt を「ログ」フォルダ配下に
+Dim ReportName
+Dim ReportTagSuccess
+Dim ReportTagError
+
+ReportName       = "test"      ' ベース名（サブフォルダを含んでもよい）
+ReportTagSuccess = "正常終了"  ' 正常終了時のタグ
+ReportTagError   = "エラー有"  ' エラーあり時のタグ
+
+'====================================================
+
+Dim excelApp
+Dim statusCell
+Dim hadError : hadError = False
+Dim results()               ' 各ブックの結果（Status, Msg）
+Dim postMsgArr()            ' Range("VBA実行後表示メッセージ") の内容
+Dim bloomJudgeArr()         ' Bloomberg エラー時の blg更新判定 の値
+Dim interrupted : interrupted = False       ' 「以降実行しない」を選んだか
+
+' ログ用
+Dim startTime, endTime
+startTime = Now()
+
+'====================================================
+' パス解決（Book, Book.xlsm, フルパス、拡張子省略すべて対応）
+'====================================================
+
+Function FileExistsEx(path)
+    FileExistsEx = CreateObject("Scripting.FileSystemObject").FileExists(path)
+End Function
+
+Function TryExcelExtensions(basePath)
+    Dim fso, exts, i, full
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    exts = Array(".xlsm", ".xlsx", ".xlsb", ".xls")
+    For i = 0 To UBound(exts)
+        full = basePath & exts(i)
+        If fso.FileExists(full) Then
+            TryExcelExtensions = full
+            Exit Function
+        End If
+    Next
+    If fso.FileExists(basePath) Then
+        TryExcelExtensions = basePath
+    Else
+        TryExcelExtensions = ""
+    End If
+End Function
+
+Function ResolveExcelPath(rawPath)
+    Dim fso, scriptDir
+    Dim hasSep, p, basePath, dotPos, sepPos, full
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
+
+    p = Trim(rawPath)
+    If p = "" Then
+        ResolveExcelPath = ""
+        Exit Function
+    End If
+
+    hasSep = (InStr(p, "\") > 0) Or (InStr(p, ":") > 0)
+
+    If hasSep Then
+        If fso.FileExists(p) Then
+            ResolveExcelPath = p
+            Exit Function
+        End If
+
+        sepPos = InStrRev(p, "\")
+        basePath = p
+        dotPos = InStrRev(basePath, ".")
+        If dotPos > sepPos Then
+            basePath = Left(basePath, dotPos - 1)
+        End If
+
+        ResolveExcelPath = TryExcelExtensions(basePath)
+    Else
+        full = fso.BuildPath(scriptDir, p)
+        If fso.FileExists(full) Then
+            ResolveExcelPath = full
+            Exit Function
+        End If
+
+        basePath = p
+        dotPos = InStrRev(basePath, ".")
+        If dotPos > 0 Then
+            basePath = Left(basePath, dotPos - 1)
+        End If
+
+        ResolveExcelPath = TryExcelExtensions(fso.BuildPath(scriptDir, basePath))
+    End If
+End Function
+
+'====================================================
+' Named Range を安全に探すヘルパ（ブック/シートスコープ両対応）
+'====================================================
+
+Function GetNamedCell(wb, nmStr)
+    Dim nm
+    On Error Resume Next
+    Set GetNamedCell = Nothing
+
+    ' まずダイレクトに試す
+    Set GetNamedCell = wb.Names(nmStr).RefersToRange
+    If Err.Number = 0 And Not GetNamedCell Is Nothing Then
+        On Error GoTo 0
+        Exit Function
+    End If
+    Err.Clear
+
+    ' 見つからなければ全 Names を総当たり
+    For Each nm In wb.Names
+        If InStr(1, nm.Name, nmStr, 1) > 0 Then
+            Set GetNamedCell = nm.RefersToRange
+            Exit For
+        End If
+    Next
+    On Error GoTo 0
+End Function
+
+'====================================================
+' Bloomberg ステータス取得
+'====================================================
+
+Function GetStatus()
+    On Error Resume Next
+    Dim v
+    v = statusCell.Value
+    If Err.Number <> 0 Then
+        Err.Clear
+        GetStatus = 3
+        Exit Function
+    End If
+    If IsNumeric(v) Then
+        GetStatus = CLng(v)
+    Else
+        GetStatus = 3
+    End If
+End Function
+
+'====================================================
+' 単一ブック処理
+'====================================================
+
+Sub ProcessWorkbook(xlApp, filePath, macroName, index)
+    Dim wb, s, i, finalStatus
+    Dim hasJudge
+    Dim shell
+    Dim runningCell, postCheckCell, postMsgCell   ' ①～③用
+    Dim bjv
+
+    Set shell = CreateObject("WScript.Shell")
+
+    '--- ブックオープン ---
+    On Error Resume Next
+    Set wb = xlApp.Workbooks.Open(filePath)
+    If Err.Number <> 0 Then
+        results(index) = Array("ERROR", "ブックを開けません：" & Err.Description)
+        hadError = True
+        Err.Clear
+        AskContinueOrExit index, filePath, "ブックを開けません"
+        Exit Sub
+    End If
+    On Error GoTo 0
+
+    '--- Named Range の取得 ---
+    Set statusCell     = GetNamedCell(wb, "blg更新判定")
+    Set runningCell    = GetNamedCell(wb, "VBA自動実行中")
+    Set postCheckCell  = GetNamedCell(wb, "VBA実行後チェック")
+    Set postMsgCell    = GetNamedCell(wb, "VBA実行後表示メッセージ")
+
+    hasJudge = Not (statusCell Is Nothing)
+
+    ' 計算モード自動
+    xlApp.Calculation = -4105   ' xlCalculationAutomatic
+
+    ' 最初の全再計算
+    xlApp.CalculateFullRebuild
+    WScript.Sleep waitShort
+
+    ' ===== blg更新判定 が無い場合は Bloomberg 判定スキップ =====
+    If Not hasJudge Then
+
+        ExecuteMacroIfNeeded xlApp, macroName, index, filePath, runningCell
+
+        '--- VBA実行後チェック（0=正常 / 1=エラー / 2=留意点あり / 3=留意点あり(サイレント)）---
+        If Not postCheckCell Is Nothing Then
+            Dim vPost, postStatus
+            postStatus = 0
+            On Error Resume Next
+            vPost = postCheckCell.Value
+            If Err.Number = 0 And IsNumeric(vPost) Then
+                postStatus = CLng(vPost)
+            End If
+            Err.Clear
+            On Error GoTo 0
+
+            If postStatus = 1 Then
+                HandlePostVBAError wb, index, filePath, postMsgCell, runningCell
+                Exit Sub
+            ElseIf postStatus = 2 Then
+                HandlePostVBAWarning wb, index, filePath, postMsgCell, runningCell
+                Exit Sub
+            ElseIf postStatus = 3 Then
+                HandlePostVBAWarningSilent wb, index, filePath, postMsgCell, runningCell
+                Exit Sub
+            End If
+        End If
+
+        ' 正常パス：保存・クローズのみ（フラグ操作は ExecuteMacroIfNeeded/Handle系で実施）
+        wb.Save
+        wb.Close False
+        results(index) = Array("OK", "判定なし（blg更新判定 なし）")
+        Exit Sub
+    End If
+
+    '================ Bloomberg 判定ループ ==================
+    finalStatus = 3
+
+    For i = 1 To maxCheckLoop
+        s = GetStatus()
+        finalStatus = s
+
+        Select Case s
+            Case 0
+                Exit For
+
+            Case 1
+                WScript.Sleep waitShort
+
+            Case 2
+                WScript.Sleep waitLong
+                xlApp.CalculateFull
+
+            Case 3
+                ' Bloomberg 未接続/エラー
+                bjv = ""
+                If Not statusCell Is Nothing Then
+                    On Error Resume Next
+                    bjv = statusCell.Value
+                    On Error GoTo 0
+                End If
+                If bjv <> "" Then
+                    bloomJudgeArr(index) = bjv
+                End If
+
+                results(index) = Array("ERROR", "Bloomberg 未接続/エラー")
+                hadError = True
+
+                wb.Close False
+                AskContinueOrExit index, filePath, "Bloomberg 未接続/エラー"
+                Exit Sub
+
+            Case Else
+                results(index) = Array("ERROR", "想定外ステータス: " & s)
+                hadError = True
+
+                wb.Close False
+                AskContinueOrExit index, filePath, "想定外ステータス"
+                Exit Sub
+        End Select
+    Next
+
+    '================ 最終処理（finalStatus=0 の時） ==================
+    If finalStatus = 0 Then
+        ' マクロ実行（失敗時は中で AskContinueOrExit を呼んでいる）
+        If ExecuteMacroIfNeeded(xlApp, macroName, index, filePath, runningCell) = False Then
+            wb.Close False
+            Exit Sub
+        End If
+
+        '--- VBA実行後チェック（0=正常 / 1=エラー / 2=留意点あり / 3=留意点あり(サイレント)）---
+        If Not postCheckCell Is Nothing Then
+            Dim vPost2, postStatus2
+            postStatus2 = 0
+            On Error Resume Next
+            vPost2 = postCheckCell.Value
+            If Err.Number = 0 And IsNumeric(vPost2) Then
+                postStatus2 = CLng(vPost2)
+            End If
+            Err.Clear
+            On Error GoTo 0
+
+            If postStatus2 = 1 Then
+                HandlePostVBAError wb, index, filePath, postMsgCell, runningCell
+                Exit Sub
+            ElseIf postStatus2 = 2 Then
+                HandlePostVBAWarning wb, index, filePath, postMsgCell, runningCell
+                Exit Sub
+            ElseIf postStatus2 = 3 Then
+                HandlePostVBAWarningSilent wb, index, filePath, postMsgCell, runningCell
+                Exit Sub
+            End If
+        End If
+
+        ' 正常パス：保存・クローズのみ
+        wb.Save
+        wb.Close False
+        results(index) = Array("OK", "")
+    Else
+        results(index) = Array("ERROR", "ステータス0にならず（finalStatus=" & finalStatus & "）")
+        hadError = True
+
+        wb.Close False
+        AskContinueOrExit index, filePath, "Bloomberg更新失敗（最終ステータス≠0）"
+        Exit Sub
+    End If
+End Sub
+
+'====================================================
+' マクロ実行（VBA自動実行中フラグをここで一括管理）
+'====================================================
+
+Function ExecuteMacroIfNeeded(xlApp, macroName, index, filePath, runningCell)
+    ExecuteMacroIfNeeded = True
+
+    ' マクロ名が空なら何もしない（フラグも触らない）
+    If macroName = "" Then
+        Exit Function
+    End If
+
+    On Error Resume Next
+
+    ' --- マクロ実行直前にフラグを 1 にする ---
+    If Not runningCell Is Nothing Then
+        runningCell.Value = 1
+    End If
+    Err.Clear
+
+    ' --- マクロ実行 ---
+    xlApp.Run macroName
+
+    If Err.Number <> 0 Then
+        ' エラー発生時：必ず 0 に戻す
+        If Not runningCell Is Nothing Then
+            On Error Resume Next
+            runningCell.Value = 0
+            On Error GoTo 0
+        End If
+
+        results(index) = Array("ERROR", "マクロ実行失敗：" & Err.Description)
+        hadError = True
+        Err.Clear
+        ExecuteMacroIfNeeded = False
+        On Error GoTo 0
+        AskContinueOrExit index, filePath, "マクロ実行失敗"
+        Exit Function
+    End If
+
+    ' --- 正常終了時も必ず 0 に戻す ---
+    If Not runningCell Is Nothing Then
+        On Error Resume Next
+        runningCell.Value = 0
+        On Error GoTo 0
+    End If
+
+    On Error GoTo 0
+End Function
+
+'====================================================
+' VBA実行後チェック =1 のとき（エラー）
+'====================================================
+
+Sub HandlePostVBAError(wb, index, filePath, postMsgCell, runningCell)
+    Dim shell
+    Dim detailMsg, baseMsg, extra
+    Dim retSave, retCont, nextIndex
+
+    Set shell = CreateObject("WScript.Shell")
+
+    extra = ""
+    If Not postMsgCell Is Nothing Then
+        On Error Resume Next
+        extra = CStr(postMsgCell.Value)
+        On Error GoTo 0
+        If Trim(extra) <> "" Then
+            postMsgArr(index) = extra
+        End If
+    End If
+
+    If Trim(extra) <> "" Then
+        detailMsg = vbCrLf & "【詳細】" & extra
+    Else
+        detailMsg = ""
+    End If
+
+    baseMsg = (index + 1) & "番目のブック「" & filePath & "」でVBA実行後にエラー発生。" & detailMsg
+
+    ' 1) このブックを保存しますか？
+    retSave = shell.Popup(baseMsg & vbCrLf & vbCrLf & "このブックを保存しますか？", _
+                          0, "VBA実行後エラー", 4 + 48)
+    If retSave = 6 Then ' Yes
+        On Error Resume Next
+        wb.Save
+        On Error GoTo 0
+    End If
+
+    ' 2) 次以降を継続しますか？
+    nextIndex = index + 2
+    retCont = shell.Popup("続けて " & nextIndex & "番目以降のブックを実行しますか？", _
+                          0, "処理継続確認", 4 + 32)
+    If retCont = 7 Then ' No
+        interrupted = True
+    End If
+
+    ' フラグを0に戻す（念のため）
+    If Not runningCell Is Nothing Then
+        On Error Resume Next
+        runningCell.Value = 0
+        On Error GoTo 0
+    End If
+
+    wb.Close False
+
+    results(index) = Array("ERROR", "VBA実行後エラー")
+    hadError = True
+End Sub
+
+'====================================================
+' 2：VBA実行後チェック =2 のとき（留意点あり＝OK＋コメント、要確認）
+'====================================================
+
+Sub HandlePostVBAWarning(wb, index, filePath, postMsgCell, runningCell)
+    Dim shell
+    Dim extra, baseMsg, detailMsg
+    Dim retSave, retCont, nextIndex
+
+    Set shell = CreateObject("WScript.Shell")
+
+    extra = ""
+    If Not postMsgCell Is Nothing Then
+        On Error Resume Next
+        extra = CStr(postMsgCell.Value)
+        On Error GoTo 0
+        If Trim(extra) <> "" Then
+            postMsgArr(index) = extra
+        End If
+    End If
+
+    If Trim(extra) <> "" Then
+        detailMsg = vbCrLf & "【留意点】" & extra
+    Else
+        detailMsg = ""
+    End If
+
+    baseMsg = (index + 1) & "番目のブック「" & filePath & "」で留意点あり。" & detailMsg
+
+    ' 1) このブックを保存しますか？
+    retSave = shell.Popup(baseMsg & vbCrLf & vbCrLf & "このブックを保存しますか？", _
+                          0, "留意点あり", 4 + 48)
+    If retSave = 6 Then ' Yes
+        On Error Resume Next
+        wb.Save
+        On Error GoTo 0
+    End If
+
+    ' 2) 次以降を継続しますか？
+    nextIndex = index + 2
+    retCont = shell.Popup("続けて " & nextIndex & "番目以降のブックを実行しますか？", _
+                          0, "処理継続確認", 4 + 32)
+    If retCont = 7 Then ' No
+        interrupted = True
+    End If
+
+    ' フラグを0に戻す（念のため）
+    If Not runningCell Is Nothing Then
+        On Error Resume Next
+        runningCell.Value = 0
+        On Error GoTo 0
+    End If
+
+    wb.Close False
+
+    ' 正常終了扱い（コメント付き）
+    results(index) = Array("OK", "留意点あり")
+End Sub
+
+'====================================================
+' 3：VBA実行後チェック =3 のとき（留意点あり＝OK＋コメント、途中確認無し）
+'====================================================
+
+Sub HandlePostVBAWarningSilent(wb, index, filePath, postMsgCell, runningCell)
+    Dim extra
+
+    extra = ""
+    If Not postMsgCell Is Nothing Then
+        On Error Resume Next
+        extra = CStr(postMsgCell.Value)
+        On Error GoTo 0
+        If Trim(extra) <> "" Then
+            postMsgArr(index) = extra
+        End If
+    End If
+
+    ' フラグを0に戻す（念のため）
+    If Not runningCell Is Nothing Then
+        On Error Resume Next
+        runningCell.Value = 0
+        On Error GoTo 0
+    End If
+
+    ' サイレントに保存して閉じる（途中確認なし）
+    On Error Resume Next
+    wb.Save
+    wb.Close False
+    On Error GoTo 0
+
+    ' 正常終了扱い（コメント付き・サイレント）
+    results(index) = Array("OK", "留意点あり（自動）")
+End Sub
+
+'====================================================
+' エラー時 Yes/No ポップアップ（Bloomberg系・マクロ系など）
+'====================================================
+
+Sub AskContinueOrExit(index, filePath, msg)
+    Dim shell
+    Dim nextIndex
+    Dim ret
+
+    Set shell = CreateObject("WScript.Shell")
+    nextIndex = index + 2  ' 人間向け 1始まり
+
+    ret = shell.Popup( _
+        (index + 1) & "番目のブック「" & filePath & "」でエラー発生：" & vbCrLf & _
+        "【" & msg & "】" & vbCrLf & vbCrLf & _
+        nextIndex & "番目以降のブックの実行を継続しますか？", _
+        0, "エラー発生", 4 + 32)
+
+    If ret = 7 Then
+        interrupted = True
+    End If
+End Sub
+
+'====================================================
+' メイン処理
+'====================================================
+
+Dim resolvedPath, macroName, rawPath
+Dim i
+
+ReDim results(UBound(jobs))
+ReDim postMsgArr(UBound(jobs))
+ReDim bloomJudgeArr(UBound(jobs))
+
+Set excelApp = CreateObject("Excel.Application")
+excelApp.Visible = False
+excelApp.DisplayAlerts = False
+excelApp.EnableEvents = False
+
+For i = 0 To UBound(jobs)
+
+    If interrupted Then
+        results(i) = Array("SKIPPED", "前のブックでエラーのため実行せず")
+    Else
+        rawPath   = jobs(i)(0)
+        macroName = jobs(i)(1)
+        resolvedPath = ResolveExcelPath(rawPath)
+
+        If resolvedPath = "" Then
+            results(i) = Array("ERROR", "ファイル見つからず：" & rawPath)
+            hadError = True
+            AskContinueOrExit i, rawPath, "ファイルが見つからない"
+        Else
+            ProcessWorkbook excelApp, resolvedPath, macroName, i
+        End If
+    End If
+
+Next
+
+excelApp.Quit
+
+'====================================================
+' 最終レポート生成
+'====================================================
+
+Dim report, okCount, errCount, skipCount
+Dim okWithCommentCount, bloomErrCount, vbaPostErrCount, otherErrCount
+okCount = 0
+errCount = 0
+skipCount = 0
+okWithCommentCount = 0
+bloomErrCount = 0
+vbaPostErrCount = 0
+otherErrCount = 0
+
+report = "=== 実行レポート ===" & vbCrLf & vbCrLf
+report = report & "実行VBS：" & WScript.ScriptFullName & vbCrLf
+report = report & "対象ブック数：" & (UBound(jobs) + 1) & vbCrLf & vbCrLf
+
+report = report & "■ 各ブックの結果" & vbCrLf
+
+For i = 0 To UBound(results)
+    Dim status, msg
+    status = results(i)(0)
+    msg    = results(i)(1)
+
+    report = report & (i + 1) & "番目（" & jobs(i)(0) & "）： " & status
+    If msg <> "" Then
+        report = report & " … " & msg
+    End If
+    report = report & vbCrLf
+
+    If status = "OK" Then
+        okCount = okCount + 1
+        If Not IsEmpty(postMsgArr(i)) Then
+            If Trim(CStr(postMsgArr(i))) <> "" Then
+                okWithCommentCount = okWithCommentCount + 1
+            End If
+        End If
+    ElseIf status = "ERROR" Then
+        errCount = errCount + 1
+        If InStr(msg, "Bloomberg 未接続/エラー") > 0 Then
+            bloomErrCount = bloomErrCount + 1
+        ElseIf InStr(msg, "VBA実行後エラー") > 0 Then
+            vbaPostErrCount = vbaPostErrCount + 1
+        Else
+            otherErrCount = otherErrCount + 1
+        End If
+    ElseIf status = "SKIPPED" Then
+        skipCount = skipCount + 1
+    End If
+Next
+
+report = report & vbCrLf
+report = report & "正常終了：" & okCount & "（うちコメントつき：" & okWithCommentCount & "）" & vbCrLf
+report = report & "Bloomberg 未接続/エラー：" & bloomErrCount & vbCrLf
+report = report & "VBA実行後エラー：" & vbaPostErrCount & vbCrLf
+report = report & "実行せず：" & skipCount & vbCrLf
+If otherErrCount > 0 Then
+    report = report & "その他エラー：" & otherErrCount & vbCrLf
+End If
+
+'====================================================
+' ■コメント セクション生成
+'====================================================
+
+Dim commentReport
+commentReport = ""
+
+If okWithCommentCount > 0 Or bloomErrCount > 0 Or vbaPostErrCount > 0 Or skipCount > 0 Then
+    commentReport = commentReport & vbCrLf & "■コメント" & vbCrLf & vbCrLf
+
+    ' ＜正常終了＞（コメント付きのみ）
+    If okWithCommentCount > 0 Then
+        commentReport = commentReport & "＜正常終了＞" & vbCrLf
+        For i = 0 To UBound(results)
+            If results(i)(0) = "OK" Then
+                If Not IsEmpty(postMsgArr(i)) Then
+                    If Trim(CStr(postMsgArr(i))) <> "" Then
+                        commentReport = commentReport & (i + 1) & "番目（" & jobs(i)(0) & "）： " & CStr(postMsgArr(i)) & vbCrLf
+                    End If
+                End If
+            End If
+        Next
+        commentReport = commentReport & vbCrLf
+    End If
+
+    ' ＜Bloomberg未接続/エラー＞
+    If bloomErrCount > 0 Then
+        commentReport = commentReport & "＜Bloomberg未接続/エラー＞" & vbCrLf
+        For i = 0 To UBound(results)
+            If results(i)(0) = "ERROR" Then
+                If InStr(results(i)(1), "Bloomberg 未接続/エラー") > 0 Then
+                    Dim lineB, bj
+                    lineB = (i + 1) & "番目（" & jobs(i)(0) & "）："
+                    bj = ""
+                    If Not IsEmpty(bloomJudgeArr(i)) Then
+                        bj = CStr(bloomJudgeArr(i))
+                    End If
+                    If Trim(bj) <> "" Then
+                        lineB = lineB & "blg更新判定" & bj & " / "
+                    End If
+                    lineB = lineB & "Bloomberg未接続、またはデータが最新化されていない可能性"
+                    commentReport = commentReport & lineB & vbCrLf
+                End If
+            End If
+        Next
+        commentReport = commentReport & vbCrLf
+    End If
+
+    ' ＜VBA実行後エラー＞
+    If vbaPostErrCount > 0 Then
+        commentReport = commentReport & "＜VBA実行後エラー＞" & vbCrLf
+        For i = 0 To UBound(results)
+            If results(i)(0) = "ERROR" Then
+                If InStr(results(i)(1), "VBA実行後エラー") > 0 Then
+                    Dim lineE, cmt
+                    lineE = (i + 1) & "番目（" & jobs(i)(0) & "）："
+                    cmt = ""
+                    If Not IsEmpty(postMsgArr(i)) Then
+                        cmt = CStr(postMsgArr(i))
+                    End If
+                    If Trim(cmt) <> "" Then
+                        lineE = lineE & cmt
+                    Else
+                        lineE = lineE & "（コメントなし）"
+                    End If
+                    commentReport = commentReport & lineE & vbCrLf
+                End If
+            End If
+        Next
+        commentReport = commentReport & vbCrLf
+    End If
+
+    ' ＜実行せず＞
+    If skipCount > 0 Then
+        commentReport = commentReport & "＜実行せず＞" & vbCrLf
+        For i = 0 To UBound(results)
+            If results(i)(0) = "SKIPPED" Then
+                commentReport = commentReport & (i + 1) & "番目（" & jobs(i)(0) & "）" & vbCrLf
+            End If
+        Next
+        commentReport = commentReport & vbCrLf
+    End If
+End If
+
+report = report & commentReport
+
+'====================================================
+' ログファイル出力（ReportName が空でない場合のみ）
+' yyyymmdd_[ReportNameベース]_正常終了/エラー有.txt
+'====================================================
+
+Dim fso, scriptName, scriptDir, logPath, logText, logFile
+Set fso = CreateObject("Scripting.FileSystemObject")
+
+If Trim(ReportName) <> "" Then
+    scriptName = fso.GetBaseName(WScript.ScriptName)
+    scriptDir  = fso.GetParentFolderName(WScript.ScriptFullName)
+
+    ' ReportName からベースパスを作る（サブフォルダ対応）
+    ' 例: "test" → scriptDir\test
+    '     "ログ\test" → scriptDir\ログ\test
+    Dim basePath, outDir, basePart
+    basePath = fso.BuildPath(scriptDir, ReportName)
+
+    outDir   = fso.GetParentFolderName(basePath)
+    If outDir = "" Then outDir = scriptDir
+    basePart = fso.GetBaseName(basePath)
+
+    ' 出力フォルダが無ければ作成（1階層想定）
+    If Not fso.FolderExists(outDir) Then
+        On Error Resume Next
+        fso.CreateFolder(outDir)
+        On Error GoTo 0
+    End If
+
+    ' 日付文字列
+    Dim dateStr, tagStr
+    dateStr = Year(Date) & Right("0" & Month(Date), 2) & Right("0" & Day(Date), 2)
+
+    If errCount > 0 Then
+        tagStr = ReportTagError
+    Else
+        tagStr = ReportTagSuccess
+    End If
+
+    ' 例: 20251209_test_正常終了.txt
+    Dim logFileName
+    logFileName = dateStr & "_" & basePart & "_" & tagStr & ".txt"
+    logPath = fso.BuildPath(outDir, logFileName)
+
+    endTime = Now()
+    Dim duration
+    duration = DateDiff("s", startTime, endTime)
+
+    logText = "=== Bloomberg & VBA 自動実行ログ ===" & vbCrLf & vbCrLf
+    logText = logText & "実行開始: " & CStr(startTime) & vbCrLf
+    logText = logText & "実行終了: " & CStr(endTime) & vbCrLf
+    logText = logText & "処理時間: " & duration & " 秒" & vbCrLf & vbCrLf
+    logText = logText & report
+
+    Set logFile = fso.CreateTextFile(logPath, True, True)  ' 上書き, Unicode
+    logFile.Write logText
+    logFile.Close
+End If
+
+'====================================================
+' 最終ポップアップ & 終了コード
+'====================================================
+
+CreateObject("WScript.Shell").Popup report, 0, "最終レポート", 64
+
+If errCount > 0 Then
+    WScript.Quit 1
+Else
+    WScript.Quit 0
+End If
+
+次
+'--- ブックオープン（リンク自動更新） ---
+On Error Resume Next
+' 第2引数 UpdateLinks:=3 で外部リンクをすべて更新
+Set wb = xlApp.Workbooks.Open(filePath, 3)
+If Err.Number <> 0 Then
+    results(index) = Array("ERROR", "ブックを開けません：" & Err.Description)
+    hadError = True
+    Err.Clear
+    AskContinueOrExit index, filePath, "ブックを開けません"
+    Exit Sub
+End If
+On Error GoTo 0
+次
+excelApp.AskToUpdateLinks = False
+    
+次のコード
 '====================================================
 ' Bloomberg 関数入り Excel を複数ファイル順番に処理する VBS
 '
