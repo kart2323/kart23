@@ -9,18 +9,24 @@
 <pre><code>
 
 
-Sub Export_ABC_AsValues()
+Sub Export_ABC_As_D_E_F()
 
     Dim wbSrc As Workbook
     Dim wbDst As Workbook
     Dim ws As Worksheet
     Dim filePath As String
+    Dim arrSrc As Variant, arrDst As Variant
+    Dim i As Long
+
+    ' 元シート名 → 出力後の新しい名前
+    arrSrc = Array("A", "B", "C")
+    arrDst = Array("D", "E", "F")
     
     On Error GoTo ErrHandler
     
     Set wbSrc = ThisWorkbook
     
-    ' 名前付き範囲「path」に保存先パスを書いておく想定
+    ' 保存先パス（名前付き範囲 "path"）
     filePath = wbSrc.Names("path").RefersToRange.Value
     
     If Len(Trim(filePath)) = 0 Then
@@ -29,34 +35,36 @@ Sub Export_ABC_AsValues()
     End If
     
     Application.ScreenUpdating = False
-    Application.DisplayAlerts = False   ' 上書き確認などを出さない
+    Application.DisplayAlerts = False
     
-    '--- シート A,B,C をコピーして新しいブックを作る ---
-    wbSrc.Sheets(Array("A", "B", "C")).Copy
-    Set wbDst = ActiveWorkbook   ' 今コピーされたブックがアクティブ
+    '--- シート A,B,C を新規ブックへ ---
+    wbSrc.Sheets(arrSrc).Copy
+    Set wbDst = ActiveWorkbook   ' コピーされた側が新ブック
     
-    '--- 各シートの数式を値に変換 ---
-    For Each ws In wbDst.Worksheets
-        With ws.UsedRange
-            .Value = .Value
-        End With
-    Next ws
+    '--- 値貼り付け ＆ シート名変更（A→D, B→E, C→F）---
+    For i = LBound(arrSrc) To UBound(arrSrc)
+        Set ws = wbDst.Worksheets(i + 1)
+        
+        ' 値貼り付け
+        ws.UsedRange.Value = ws.UsedRange.Value
+        
+        ' シート名変更
+        ws.Name = arrDst(i)
+    Next i
     
-    '--- 上書き保存（既にあっても確認なしで上書き）---
-    ' 拡張子が .xlsx 前提の例（必要に応じて変えてOK）
+    '--- 新規保存（上書き確認なし）---
     wbDst.SaveAs Filename:=filePath, FileFormat:=xlOpenXMLWorkbook
-    
     wbDst.Close SaveChanges:=False
     
 CleanUp:
     Application.DisplayAlerts = True
     Application.ScreenUpdating = True
     Exit Sub
-    
+
 ErrHandler:
     Application.DisplayAlerts = True
     Application.ScreenUpdating = True
-    MsgBox "エラーが発生しました: " & Err.Description, vbCritical
+    MsgBox "エラー: " & Err.Description, vbCritical
 End Sub
 
 次
