@@ -7,6 +7,59 @@
 <h1>copy </h1>
 <p>copy code
 <pre><code>
+
+
+Sub Export_ABC_AsValues()
+
+    Dim wbSrc As Workbook
+    Dim wbDst As Workbook
+    Dim ws As Worksheet
+    Dim filePath As String
+    
+    On Error GoTo ErrHandler
+    
+    Set wbSrc = ThisWorkbook
+    
+    ' 名前付き範囲「path」に保存先パスを書いておく想定
+    filePath = wbSrc.Names("path").RefersToRange.Value
+    
+    If Len(Trim(filePath)) = 0 Then
+        MsgBox "保存先パス（名前付き範囲 ""path""）が空です。", vbExclamation
+        Exit Sub
+    End If
+    
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False   ' 上書き確認などを出さない
+    
+    '--- シート A,B,C をコピーして新しいブックを作る ---
+    wbSrc.Sheets(Array("A", "B", "C")).Copy
+    Set wbDst = ActiveWorkbook   ' 今コピーされたブックがアクティブ
+    
+    '--- 各シートの数式を値に変換 ---
+    For Each ws In wbDst.Worksheets
+        With ws.UsedRange
+            .Value = .Value
+        End With
+    Next ws
+    
+    '--- 上書き保存（既にあっても確認なしで上書き）---
+    ' 拡張子が .xlsx 前提の例（必要に応じて変えてOK）
+    wbDst.SaveAs Filename:=filePath, FileFormat:=xlOpenXMLWorkbook
+    
+    wbDst.Close SaveChanges:=False
+    
+CleanUp:
+    Application.DisplayAlerts = True
+    Application.ScreenUpdating = True
+    Exit Sub
+    
+ErrHandler:
+    Application.DisplayAlerts = True
+    Application.ScreenUpdating = True
+    MsgBox "エラーが発生しました: " & Err.Description, vbCritical
+End Sub
+
+次
 '====================================================
 ' Bloomberg + Excel 自動実行 VBS（ログ・各種フラグ付き 拡張版）
 '====================================================
