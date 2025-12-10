@@ -9,65 +9,6 @@
 <pre><code>
 
 
-Sub Export_ABC_As_D_E_F()
-
-    Dim wbSrc As Workbook
-    Dim wbDst As Workbook
-    Dim ws As Worksheet
-    Dim filePath As String
-    Dim arrSrc As Variant, arrDst As Variant
-    Dim i As Long
-
-    ' 元シート名 → 出力後の新しい名前
-    arrSrc = Array("A", "B", "C")
-    arrDst = Array("D", "E", "F")
-    
-    On Error GoTo ErrHandler
-    
-    Set wbSrc = ThisWorkbook
-    
-    ' 保存先パス（名前付き範囲 "path"）
-    filePath = wbSrc.Names("path").RefersToRange.Value
-    
-    If Len(Trim(filePath)) = 0 Then
-        MsgBox "保存先パス（名前付き範囲 ""path""）が空です。", vbExclamation
-        Exit Sub
-    End If
-    
-    Application.ScreenUpdating = False
-    Application.DisplayAlerts = False
-    
-    '--- シート A,B,C を新規ブックへ ---
-    wbSrc.Sheets(arrSrc).Copy
-    Set wbDst = ActiveWorkbook   ' コピーされた側が新ブック
-    
-    '--- 値貼り付け ＆ シート名変更（A→D, B→E, C→F）---
-    For i = LBound(arrSrc) To UBound(arrSrc)
-        Set ws = wbDst.Worksheets(i + 1)
-        
-        ' 値貼り付け
-        ws.UsedRange.Value = ws.UsedRange.Value
-        
-        ' シート名変更
-        ws.Name = arrDst(i)
-    Next i
-    
-    '--- 新規保存（上書き確認なし）---
-    wbDst.SaveAs Filename:=filePath, FileFormat:=xlOpenXMLWorkbook
-    wbDst.Close SaveChanges:=False
-    
-CleanUp:
-    Application.DisplayAlerts = True
-    Application.ScreenUpdating = True
-    Exit Sub
-
-ErrHandler:
-    Application.DisplayAlerts = True
-    Application.ScreenUpdating = True
-    MsgBox "エラー: " & Err.Description, vbCritical
-End Sub
-
-次
 '====================================================
 ' Bloomberg + Excel 自動実行 VBS（ログ・各種フラグ付き 拡張版）
 '====================================================
@@ -77,10 +18,10 @@ Option Explicit
 '================ ユーザー設定 =====================
 Dim jobs
 jobs = Array( _
-    Array("Book1.xlsm", "MacroA"), _
-    Array("Book2", ""), _
-    Array("C:\Path\To\Book3", "Module1.PostProcess") _
+    Array("test2.xlsm", "Macro2"), _
+    Array("test1.xlsm", "Macro1") _
 )
+
 
 Dim waitShort, waitLong
 waitShort = 5000     ' ステータス1 → 再チェック待ち (ms)
@@ -90,13 +31,13 @@ Dim maxCheckLoop
 maxCheckLoop = 30     ' ステータス1/2 の最大チェック回数
 
 ' ログ出力名設定：
-' ReportName = "test"           → yyyymmdd_test_正常終了/エラー有.txt
-' ReportName = "ログ\test"      → yyyymmdd_test_正常終了/エラー有.txt を「ログ」フォルダ配下に
+' ReportName = "test"           → yyyymmdd_正常終了/エラー有_test.txt
+' ReportName = "ログ\test"      → yyyymmdd_正常終了/エラー有_test.txt を「ログ」フォルダ配下に
 Dim ReportName
 Dim ReportTagSuccess
 Dim ReportTagError
 
-ReportName       = "test"      ' ベース名（サブフォルダを含んでもよい）
+ReportName       = "ログ\test"      ' ベース名（サブフォルダを含んでもよい）
 ReportTagSuccess = "正常終了"  ' 正常終了時のタグ
 ReportTagError   = "エラー有"  ' エラーあり時のタグ
 
@@ -106,7 +47,7 @@ Dim excelApp
 Dim statusCell
 Dim hadError : hadError = False
 Dim results()               ' 各ブックの結果（Status, Msg）
-Dim postMsgArr()            ' Range("VBA実行後表示メッセージ") の内容
+Dim postMsgArr()            ' Range("VBA自動実行後表示メッセージ") の内容
 Dim bloomJudgeArr()         ' Bloomberg エラー時の blg更新判定 の値
 Dim interrupted : interrupted = False       ' 「以降実行しない」を選んだか
 
@@ -248,7 +189,7 @@ Sub ProcessWorkbook(xlApp, filePath, macroName, index)
 
     '--- ブックオープン ---
     On Error Resume Next
-    Set wb = xlApp.Workbooks.Open(filePath)
+    Set wb = xlApp.Workbooks.Open(filePath,3)
     If Err.Number <> 0 Then
         results(index) = Array("ERROR", "ブックを開けません：" & Err.Description)
         hadError = True
@@ -266,6 +207,13 @@ Sub ProcessWorkbook(xlApp, filePath, macroName, index)
 
     hasJudge = Not (statusCell Is Nothing)
 
+    '--- VBA自動実行中フラグ ON (1) ---
+    If Not runningCell Is Nothing Then
+        On Error Resume Next
+        runningCell.Value = 1
+        On Error GoTo 0
+    End If
+
     ' 計算モード自動
     xlApp.Calculation = -4105   ' xlCalculationAutomatic
 
@@ -276,7 +224,7 @@ Sub ProcessWorkbook(xlApp, filePath, macroName, index)
     ' ===== blg更新判定 が無い場合は Bloomberg 判定スキップ =====
     If Not hasJudge Then
 
-        ExecuteMacroIfNeeded xlApp, macroName, index, filePath, runningCell
+        ExecuteMacroIfNeeded xlApp, macroName, index, filePath
 
         '--- VBA実行後チェック（0=正常 / 1=エラー / 2=留意点あり / 3=留意点あり(サイレント)）---
         If Not postCheckCell Is Nothing Then
@@ -302,7 +250,13 @@ Sub ProcessWorkbook(xlApp, filePath, macroName, index)
             End If
         End If
 
-        ' 正常パス：保存・クローズのみ（フラグ操作は ExecuteMacroIfNeeded/Handle系で実施）
+        ' 正常パス：フラグを0に戻して保存・クローズ
+        If Not runningCell Is Nothing Then
+            On Error Resume Next
+            runningCell.Value = 0
+            On Error GoTo 0
+        End If
+
         wb.Save
         wb.Close False
         results(index) = Array("OK", "判定なし（blg更新判定 なし）")
@@ -342,6 +296,12 @@ Sub ProcessWorkbook(xlApp, filePath, macroName, index)
                 results(index) = Array("ERROR", "Bloomberg 未接続/エラー")
                 hadError = True
 
+                If Not runningCell Is Nothing Then
+                    On Error Resume Next
+                    runningCell.Value = 0
+                    On Error GoTo 0
+                End If
+
                 wb.Close False
                 AskContinueOrExit index, filePath, "Bloomberg 未接続/エラー"
                 Exit Sub
@@ -349,6 +309,12 @@ Sub ProcessWorkbook(xlApp, filePath, macroName, index)
             Case Else
                 results(index) = Array("ERROR", "想定外ステータス: " & s)
                 hadError = True
+
+                If Not runningCell Is Nothing Then
+                    On Error Resume Next
+                    runningCell.Value = 0
+                    On Error GoTo 0
+                End If
 
                 wb.Close False
                 AskContinueOrExit index, filePath, "想定外ステータス"
@@ -359,7 +325,12 @@ Sub ProcessWorkbook(xlApp, filePath, macroName, index)
     '================ 最終処理（finalStatus=0 の時） ==================
     If finalStatus = 0 Then
         ' マクロ実行（失敗時は中で AskContinueOrExit を呼んでいる）
-        If ExecuteMacroIfNeeded(xlApp, macroName, index, filePath, runningCell) = False Then
+        If ExecuteMacroIfNeeded(xlApp, macroName, index, filePath) = False Then
+            If Not runningCell Is Nothing Then
+                On Error Resume Next
+                runningCell.Value = 0
+                On Error GoTo 0
+            End If
             wb.Close False
             Exit Sub
         End If
@@ -388,13 +359,25 @@ Sub ProcessWorkbook(xlApp, filePath, macroName, index)
             End If
         End If
 
-        ' 正常パス：保存・クローズのみ
+        ' 正常パス：フラグを0に戻して保存・クローズ
+        If Not runningCell Is Nothing Then
+            On Error Resume Next
+            runningCell.Value = 0
+            On Error GoTo 0
+        End If
+
         wb.Save
         wb.Close False
         results(index) = Array("OK", "")
     Else
         results(index) = Array("ERROR", "ステータス0にならず（finalStatus=" & finalStatus & "）")
         hadError = True
+
+        If Not runningCell Is Nothing Then
+            On Error Resume Next
+            runningCell.Value = 0
+            On Error GoTo 0
+        End If
 
         wb.Close False
         AskContinueOrExit index, filePath, "Bloomberg更新失敗（最終ステータス≠0）"
@@ -403,53 +386,23 @@ Sub ProcessWorkbook(xlApp, filePath, macroName, index)
 End Sub
 
 '====================================================
-' マクロ実行（VBA自動実行中フラグをここで一括管理）
+' マクロ実行
 '====================================================
 
-Function ExecuteMacroIfNeeded(xlApp, macroName, index, filePath, runningCell)
+Function ExecuteMacroIfNeeded(xlApp, macroName, index, filePath)
     ExecuteMacroIfNeeded = True
-
-    ' マクロ名が空なら何もしない（フラグも触らない）
-    If macroName = "" Then
-        Exit Function
-    End If
-
-    On Error Resume Next
-
-    ' --- マクロ実行直前にフラグを 1 にする ---
-    If Not runningCell Is Nothing Then
-        runningCell.Value = 1
-    End If
-    Err.Clear
-
-    ' --- マクロ実行 ---
-    xlApp.Run macroName
-
-    If Err.Number <> 0 Then
-        ' エラー発生時：必ず 0 に戻す
-        If Not runningCell Is Nothing Then
-            On Error Resume Next
-            runningCell.Value = 0
-            On Error GoTo 0
-        End If
-
-        results(index) = Array("ERROR", "マクロ実行失敗：" & Err.Description)
-        hadError = True
-        Err.Clear
-        ExecuteMacroIfNeeded = False
-        On Error GoTo 0
-        AskContinueOrExit index, filePath, "マクロ実行失敗"
-        Exit Function
-    End If
-
-    ' --- 正常終了時も必ず 0 に戻す ---
-    If Not runningCell Is Nothing Then
+    If macroName <> "" Then
         On Error Resume Next
-        runningCell.Value = 0
+        xlApp.Run macroName
+        If Err.Number <> 0 Then
+            results(index) = Array("ERROR", "マクロ実行失敗：" & Err.Description)
+            hadError = True
+            Err.Clear
+            ExecuteMacroIfNeeded = False
+            AskContinueOrExit index, filePath, "マクロ実行失敗"
+        End If
         On Error GoTo 0
     End If
-
-    On Error GoTo 0
 End Function
 
 '====================================================
@@ -498,7 +451,7 @@ Sub HandlePostVBAError(wb, index, filePath, postMsgCell, runningCell)
         interrupted = True
     End If
 
-    ' フラグを0に戻す（念のため）
+    ' フラグを0に戻す
     If Not runningCell Is Nothing Then
         On Error Resume Next
         runningCell.Value = 0
@@ -557,7 +510,7 @@ Sub HandlePostVBAWarning(wb, index, filePath, postMsgCell, runningCell)
         interrupted = True
     End If
 
-    ' フラグを0に戻す（念のため）
+    ' フラグを0に戻す
     If Not runningCell Is Nothing Then
         On Error Resume Next
         runningCell.Value = 0
@@ -587,7 +540,7 @@ Sub HandlePostVBAWarningSilent(wb, index, filePath, postMsgCell, runningCell)
         End If
     End If
 
-    ' フラグを0に戻す（念のため）
+    ' フラグを0に戻す
     If Not runningCell Is Nothing Then
         On Error Resume Next
         runningCell.Value = 0
@@ -851,9 +804,9 @@ If Trim(ReportName) <> "" Then
         tagStr = ReportTagSuccess
     End If
 
-    ' 例: 20251209_test_正常終了.txt
+    ' 例: 20251209_正常終了_test.txt
     Dim logFileName
-    logFileName = dateStr & "_" & basePart & "_" & tagStr & ".txt"
+    logFileName = dateStr & "_" & tagStr & "_" & basePart & ".txt"
     logPath = fso.BuildPath(outDir, logFileName)
 
     endTime = Now()
@@ -883,22 +836,129 @@ Else
     WScript.Quit 0
 End If
 
+
 次
-'--- ブックオープン（リンク自動更新） ---
-On Error Resume Next
-' 第2引数 UpdateLinks:=3 で外部リンクをすべて更新
-Set wb = xlApp.Workbooks.Open(filePath, 3)
-If Err.Number <> 0 Then
-    results(index) = Array("ERROR", "ブックを開けません：" & Err.Description)
-    hadError = True
-    Err.Clear
-    AskContinueOrExit index, filePath, "ブックを開けません"
-    Exit Sub
+Option Explicit
+
+'================ ユーザー設定 ====================
+' ログを探すフォルダ指定
+'   ""                → このVBSと同じフォルダ
+'   "ログ"            → このVBSと同じフォルダ直下の「ログ」フォルダ
+'   "C:\folder\log"   → 絶対パスでもOK
+Dim logFolderSetting
+logFolderSetting = "ログ"      ' ←必要に応じて変更
+
+' 条件を満たした場合に実行する VBS
+'   ""                → 実行なし
+'   "Next.vbs"        → このVBSと同じフォルダの Next.vbs
+'   "サブ\Next.vbs"   → サブフォルダ内
+'   "C:\Path\Next.vbs"→ 絶対パスでもOK
+Dim nextVbsSetting
+nextVbsSetting = "msg表示テスト.VBS"   ' ←必要に応じて変更
+'=================================================
+
+Dim fso, shell
+Dim scriptDir, scriptName
+Dim searchDir
+Dim folder, f
+Dim logFound
+Dim nextVbsPath, nextVbsName
+Dim msg
+
+Set fso   = CreateObject("Scripting.FileSystemObject")
+Set shell = CreateObject("WScript.Shell")
+
+scriptDir  = fso.GetParentFolderName(WScript.ScriptFullName)
+scriptName = fso.GetFileName(WScript.ScriptFullName)
+
+'====================================================
+' 実行日（yyyymmdd）を生成
+'====================================================
+Dim yyyymmdd, prefix
+yyyymmdd = Year(Date) & Right("0" & Month(Date), 2) & Right("0" & Day(Date), 2)
+' 例：2025/12/11 → "20251211"
+prefix = yyyymmdd & "_正常終了"   ' 例：20251211_正常終了
+
+'====================================================
+' ログ検索フォルダを解決
+'====================================================
+If Trim(logFolderSetting) = "" Then
+    searchDir = scriptDir
+ElseIf InStr(logFolderSetting, ":") > 0 Or Left(logFolderSetting, 2) = "\\" Then
+    searchDir = logFolderSetting
+Else
+    searchDir = fso.BuildPath(scriptDir, logFolderSetting)
 End If
-On Error GoTo 0
+
+If Not fso.FolderExists(searchDir) Then
+    msg = scriptName & "：パス [" & searchDir & "] が存在しません。ログを確認できません。"
+    MsgBox msg, 48  ' vbExclamation=48
+    WScript.Quit 1
+End If
+
+Set folder = fso.GetFolder(searchDir)
+
+'====================================================
+' yyyymmdd_正常終了*.txt を探す
+'====================================================
+logFound = False
+
+For Each f In folder.Files
+    If LCase(fso.GetExtensionName(f.Name)) = "txt" Then
+        ' 先頭が "yyyymmdd_正常終了" かどうかで判定
+        If Left(f.Name, Len(prefix)) = prefix Then
+            logFound = True
+            Exit For
+        End If
+    End If
+Next
+
+'====================================================
+' 見つからなかった場合
+'====================================================
+If Not logFound Then
+    If Trim(nextVbsSetting) <> "" Then
+        nextVbsName = nextVbsSetting
+    Else
+        nextVbsName = "(次VBS未指定)"
+    End If
+
+    msg = scriptName & vbCrLf & _
+          "パス [" & searchDir & "] に" & vbCrLf & _
+          prefix & "*.txt が存在しなかったため、" & vbCrLf & _
+          "[" & nextVbsName & "] を実行せず終了します。"
+
+    MsgBox msg, 64  ' vbInformation=64
+    WScript.Quit 0
+End If
+
+'====================================================
+' 見つかったため、次の VBS を起動
+'====================================================
+If Trim(nextVbsSetting) = "" Then
+    MsgBox scriptName & "：ログは見つかりましたが、実行するVBSが指定されていません。", 48
+    WScript.Quit 1
+End If
+
+' パス解決
+If InStr(nextVbsSetting, ":") > 0 Or Left(nextVbsSetting, 2) = "\\" Then
+    nextVbsPath = nextVbsSetting
+Else
+    nextVbsPath = fso.BuildPath(scriptDir, nextVbsSetting)
+End If
+
+If Not fso.FileExists(nextVbsPath) Then
+    MsgBox scriptName & "：実行対象のVBS [" & nextVbsPath & "] が見つかりません。", 48
+    WScript.Quit 1
+End If
+
+' 非同期実行（待たない）
+shell.Run """" & nextVbsPath & """", 1, False
+
+WScript.Quit 0
+
 次
-excelApp.AskToUpdateLinks = False
-    
+ 
 次のコード
 '====================================================
 ' Bloomberg 関数入り Excel を複数ファイル順番に処理する VBS
